@@ -1,15 +1,21 @@
 import calendar
 import io
+import os
+import wave
 from datetime import date
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 import numpy as np
 import requests
 import streamlit as st
 from PIL import Image, ImageDraw
-import wave
 
-JAXA_EARTH_API_URL = "https://data.earth.jaxa.jp/api/v1/observations"
+DEFAULT_JAXA_ENDPOINTS = [
+    "https://data.earth.jaxa.jp/api/v1/observations",
+    "https://data.earth.jaxa.jp/api/v1/point",
+    "https://data.earth.jaxa.jp/api/v1/timeseries/point",
+]
 
 
 def previous_month_range(target_month: date) -> Tuple[str, str]:
@@ -43,7 +49,42 @@ def fallback_satellite_values(lat: float, lon: float) -> Dict[str, float]:
     }
 
 
-def fetch_satellite_data(lat: float, lon: float, target_month: date) -> Dict[str, float]:
+def try_parse_satellite_payload(payload: Dict) -> Optional[Dict[str, float]]:
+    candidate_objects = [payload]
+    if isinstance(payload.get("data"), dict):
+        candidate_objects.append(payload["data"])
+    if isinstance(payload.get("results"), list) and payload["results"]:
+        first = payload["results"][0]
+        if isinstance(first, dict):
+            candidate_objects.append(first)
+    if isinstance(payload.get("items"), list) and payload["items"]:
+        first = payload["items"][0]
+        if isinstance(first, dict):
+            candidate_objects.append(first)
+
+    for obj in candidate_objects:
+        ndvi_raw = obj.get("ndvi_monthly", obj.get("ndvi"))
+        lst_raw = obj.get("lst_monthly", obj.get("lst", obj.get("surface_temperature")))
+        precip_raw = obj.get("precip_monthly", obj.get("precip", obj.get("precipitation")))
+        if ndvi_raw is None or lst_raw is None or precip_raw is None:
+            continue
+        try:
+            return {
+                "ndvi": float(ndvi_raw),
+                "lst": float(lst_raw),
+                "precip": float(precip_raw),
+            }
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def fetch_satellite_data(
+    lat: float,
+    lon: float,
+    target_month: date,
+    endpoint_override: str,
+) -> Tuple[Dict[str, float], str, List[str]]:
     start, end = previous_month_range(target_month)
 
     params = {
@@ -54,25 +95,28 @@ def fetch_satellite_data(lat: float, lon: float, target_month: date) -> Dict[str
         "variables": "ndvi_monthly,lst_monthly,precip_monthly",
     }
 
-    try:
-        res = requests.get(JAXA_EARTH_API_URL, params=params, timeout=20)
-        res.raise_for_status()
-        payload = res.json()
+    endpoints = [e.strip() for e in endpoint_override.splitlines() if e.strip()]
+    if not endpoints:
+        env_endpoint = os.environ.get("JAXA_EARTH_API_URL", "").strip()
+        endpoints = [env_endpoint] if env_endpoint else DEFAULT_JAXA_ENDPOINTS
 
-        # 想定レスポンス形式の違いに対応
-        data = payload.get("data", payload)
+    errors: List[str] = []
+    for endpoint in endpoints:
+        try:
+            res = requests.get(endpoint, params=params, timeout=20)
+            if res.status_code == 404:
+                errors.append(f"404 Not Found: {endpoint}?{urlencode(params)}")
+                continue
+            res.raise_for_status()
+            payload = res.json()
+            parsed = try_parse_satellite_payload(payload)
+            if parsed:
+                return parsed, endpoint, errors
+            errors.append(f"レスポンス解析失敗: {endpoint} (keys={list(payload.keys())[:8]})")
+        except Exception as exc:
+            errors.append(f"{endpoint} -> {exc}")
 
-        ndvi = float(data.get("ndvi_monthly", data.get("ndvi")))
-        lst = float(data.get("lst_monthly", data.get("lst")))
-        precip = float(data.get("precip_monthly", data.get("precip")))
-
-        return {"ndvi": ndvi, "lst": lst, "precip": precip}
-    except Exception as exc:  # API未接続時のフォールバック
-        st.warning(
-            "JAXA Earth API への接続に失敗したため、座標に基づく代替データを使います。"
-            f"\n\n詳細: {exc}"
-        )
-        return fallback_satellite_values(lat, lon)
+    return fallback_satellite_values(lat, lon), "fallback", errors
 
 
 def create_space_landscape(ndvi: float, lst: float, precip: float) -> Image.Image:
@@ -89,7 +133,6 @@ def create_space_landscape(ndvi: float, lst: float, precip: float) -> Image.Imag
     img = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(img)
 
-    # 宇宙風グラデーション背景
     for y in range(height):
         t = y / max(1, height - 1)
         r = int(sky_top[0] * (1 - t) + sky_bottom[0] * t)
@@ -97,7 +140,6 @@ def create_space_landscape(ndvi: float, lst: float, precip: float) -> Image.Imag
         b = int(sky_top[2] * (1 - t) + sky_bottom[2] * t)
         draw.line([(0, y), (width, y)], fill=(r, g, b))
 
-    # 星
     rng = np.random.default_rng(int(ndvi_n * 1000 + precip_n * 2000 + lst_n * 3000))
     for _ in range(220):
         x = int(rng.uniform(0, width))
@@ -106,12 +148,10 @@ def create_space_landscape(ndvi: float, lst: float, precip: float) -> Image.Imag
         color = (255, 255, int(rng.uniform(180, 255)))
         draw.ellipse((x, y, x + size, y + size), fill=color)
 
-    # 地面
     ground_y = int(height * 0.62)
     ground_color = (80, 60 + int(80 * ndvi_n), 40)
     draw.rectangle((0, ground_y, width, height), fill=ground_color)
 
-    # 水域（降水量依存）
     water_count = int(1 + precip_n * 5)
     for i in range(water_count):
         x1 = int((i / max(1, water_count)) * width * 0.9)
@@ -120,7 +160,6 @@ def create_space_landscape(ndvi: float, lst: float, precip: float) -> Image.Imag
         y2 = y1 + int(90 + precip_n * 90)
         draw.ellipse((x1, y1, x2, y2), fill=(70, 140, 210))
 
-    # 森（NDVI依存）
     tree_count = int(4 + ndvi_n * 26)
     for _ in range(tree_count):
         tx = int(rng.uniform(20, width - 20))
@@ -134,12 +173,10 @@ def create_space_landscape(ndvi: float, lst: float, precip: float) -> Image.Imag
             fill=(30, 110 + int(ndvi_n * 120), 40),
         )
 
-    # 明るい雰囲気（LST依存）
     if lst_n > 0.5:
         glow = Image.new("RGBA", (width, height), (255, 245, 180, int(70 * lst_n)))
         img = Image.alpha_composite(img.convert("RGBA"), glow).convert("RGB")
 
-    # 惑星
     px, py = int(width * 0.78), int(height * 0.2)
     pr = int(80 + base_brightness * 0.2)
     draw = ImageDraw.Draw(img)
@@ -158,23 +195,18 @@ def synthesize_music(ndvi: float, lst: float, precip: float, duration_sec: int =
     beat_sec = 60.0 / tempo
 
     t = np.linspace(0, duration_sec, duration_sec * sr, endpoint=False)
-
-    # アコースティック成分（NDVIが高いほど強い）
     acoustic = (
         0.6 * np.sin(2 * np.pi * 220 * t)
         + 0.3 * np.sin(2 * np.pi * 330 * t)
         + 0.2 * np.sin(2 * np.pi * 440 * t)
     ) * (0.2 + 0.8 * ndvi_n)
 
-    # シンセ成分（降水量が高いほど強い）
     synth_freq = 110 + precip_n * 330
     synth = np.sign(np.sin(2 * np.pi * synth_freq * t)) * (0.15 + 0.85 * precip_n)
 
-    # テンポに合わせたパーカッシブゲート
     gate = (np.sin(2 * np.pi * (1 / beat_sec) * t) > 0).astype(float)
     gate = 0.35 + 0.65 * gate
 
-    # 雨ノイズ（降水量で増加）
     rng = np.random.default_rng(int((ndvi + lst + precip) * 1000))
     rain_noise = rng.normal(0, 1, len(t)) * 0.04 * precip_n
 
@@ -229,6 +261,14 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    with st.expander("API設定（404が出る場合）"):
+        endpoint_override = st.text_area(
+            "JAXA APIエンドポイント（1行に1URL）",
+            value="\n".join(DEFAULT_JAXA_ENDPOINTS),
+            help="404になる場合、正しいエンドポイントURLをここに貼り付けてください。",
+            height=120,
+        )
+
     with st.container(border=True):
         lat = st.number_input("緯度 (Latitude)", min_value=-90.0, max_value=90.0, value=35.68, step=0.01)
         lon = st.number_input("経度 (Longitude)", min_value=-180.0, max_value=180.0, value=139.76, step=0.01)
@@ -237,11 +277,18 @@ def main() -> None:
 
     if generate:
         with st.spinner("衛星データを取得して作品を生成中..."):
-            sat = fetch_satellite_data(lat, lon, month)
+            sat, source, errors = fetch_satellite_data(lat, lon, month, endpoint_override)
             image = create_space_landscape(sat["ndvi"], sat["lst"], sat["precip"])
             wav = synthesize_music(sat["ndvi"], sat["lst"], sat["precip"])
 
-        st.success("生成が完了しました！")
+        if source == "fallback":
+            st.warning("JAXA API取得に失敗したため、座標ベースの代替データを使用しました。")
+            with st.expander("取得エラーの詳細"):
+                for e in errors:
+                    st.code(e)
+        else:
+            st.success(f"JAXA API 取得成功: {source}")
+
         st.write(
             {
                 "target_month": month.strftime("%Y-%m"),
@@ -249,6 +296,7 @@ def main() -> None:
                 "ndvi_monthly": round(sat["ndvi"], 4),
                 "lst_monthly_celsius": round(sat["lst"], 2),
                 "precip_monthly_mm": round(sat["precip"], 2),
+                "data_source": source,
             }
         )
 
