@@ -42,3 +42,19 @@ streamlit run app.py
 JAXA 側のAPIパスや公開形態が変わっていると、`404 Not Found` になることがあります。
 このアプリでは **API設定（404が出る場合）** からエンドポイントURLを複数指定できます（1行1URL）。
 取得失敗時はエラー詳細を表示し、最後に座標ベース代替データで生成を継続します。
+
+## マージできないとき（コンフリクト解消）
+
+ローカルで次を実行して、最新の `main` を取り込んでから push してください。
+
+```bash
+git fetch origin
+git rebase origin/main
+# コンフリクトが出たファイルを修正
+git add <修正したファイル>
+git rebase --continue
+git push --force-with-lease
+```
+
+このリポジトリでは `.gitignore` を追加して、`__pycache__` や仮想環境差分がPRに混入しないようにしています。
+
